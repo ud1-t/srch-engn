@@ -12,7 +12,7 @@ target/
 *.iml
 *.ipr
 
-.META_INF/MANIFEST.MF
+.META_-NF/MANIFEST.MF
 
 ### Eclipse ###
 .apt_generated
