@@ -4,12 +4,14 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import com.search.index.InvertedIndex;
 import com.search.index.Posting;
+import com.search.model.Token;
 import com.search.storage.IndexRepository;
 
 public class IndexRepositoryImpl implements IndexRepository {
@@ -20,20 +22,24 @@ public class IndexRepositoryImpl implements IndexRepository {
         this.connection = connection;
     }
 
-    private static final String DELETE_TERMS_SQL = """
-        DELETE FROM terms
-        """;
-    private static final String DELETE_POSTINGS_SQL = """
-        DELETE FROM postings
-        """;
+    private static final String SELECT_TERM_ID_SQL = """
+        SELECT id FROM terms WHERE term = ?
+    """;
+
     private static final String INSERT_TERM_SQL = """
         INSERT INTO terms (term, df)
-        VALUES (?, ?) returning id
-        """;
+        VALUES (?, 0)
+        RETURNING id
+    """;
+
+    private static final String INCREMENT_DF_SQL = """
+        UPDATE terms SET df = df + 1 WHERE id = ?
+    """;
     private static final String INSERT_POSTING_SQL = """
         INSERT INTO postings (term_id, doc_id, tf, positions, offsets)
         VALUES (?, ?, ?, ?, ?)
-        """;
+        ON CONFLICT (term_id, doc_id) DO NOTHING
+    """;
     private static final String SELECT_TERMS_SQL = """
         SELECT id, term FROM terms
         """;
@@ -43,19 +49,43 @@ public class IndexRepositoryImpl implements IndexRepository {
         """;
 
     @Override
-    public void saveIndex(InvertedIndex index) {
+    public void appendDocument(int docId, List<Token> tokens) {
         try {
             connection.setAutoCommit(false);
-            clearOldIndexSnapshot();
-            Map<String, Integer> termIdMap = insertTerms(index);
-            insertPostings(index, termIdMap);
+
+            Map<String, List<Token>> byTerm = tokens.stream()
+                    .collect(Collectors.groupingBy(Token::getTerm));
+
+            for (var entry : byTerm.entrySet()) {
+                String term = entry.getKey();
+                List<Token> termTokens = entry.getValue();
+
+                TermLookup lookup = getOrCreateTerm(term);
+                int termId = lookup.id;
+                incrementDf(termId);
+
+                Posting posting = new Posting();
+                for (Token t : termTokens) {
+                    posting.addOccurrence(t.getPosition(), t.getOffset());
+                }
+
+                insertPosting(termId, docId, posting);
+            }
+
             connection.commit();
+
         } catch (Exception e) {
             rollbackTransaction();
-            throw new RuntimeException("Error saving index", e);
+            throw new RuntimeException("Failed to append document " + docId, e);
         } finally {
             resetAutoCommit();
         }
+    }
+
+    private void rollbackTransaction() {
+        try {
+            connection.rollback();
+        } catch (SQLException ignored) { }
     }
 
     @Override
@@ -68,65 +98,39 @@ public class IndexRepositoryImpl implements IndexRepository {
         }
     }
 
-    private void clearOldIndexSnapshot() throws SQLException {
-        try (Statement s = connection.createStatement()) {
-            s.executeUpdate(DELETE_POSTINGS_SQL);
-            s.executeUpdate(DELETE_TERMS_SQL);
+    private TermLookup getOrCreateTerm(String term) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_TERM_ID_SQL)) {
+            ps.setString(1, term);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return new TermLookup(rs.getInt(1), false);
+            }
         }
-    }
 
-    private Map<String, Integer> insertTerms(InvertedIndex index) throws SQLException {
-        Map<String, Integer> termIdMap = new HashMap<>();
         try (PreparedStatement ps = connection.prepareStatement(INSERT_TERM_SQL)) {
-            for(var termEntry: index.getIndex().entrySet()) {
-                String term = termEntry.getKey();
-                int df = termEntry.getValue().size();
-            
-                ps.setString(1, term);
-                ps.setInt(2, df);
-
-                var rs = ps.executeQuery();
-                rs.next();
-
-                int termId = rs.getInt(1);
-                termIdMap.put(term, termId);
-            }
+            ps.setString(1, term);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            return new TermLookup(rs.getInt(1), true);
         }
-
-        return termIdMap;
     }
 
-    private void insertPostings(InvertedIndex index, Map<String, Integer> termIdMap) throws SQLException {
+    private void incrementDf(int termId) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(INCREMENT_DF_SQL)) {
+            ps.setInt(1, termId);
+            ps.executeUpdate();
+        }
+    }
+
+    private void insertPosting(int termId, int docId, Posting posting) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(INSERT_POSTING_SQL)) {
-            for(var termEntry: index.getIndex().entrySet()) {
-                String term = termEntry.getKey();
-                int termId = termIdMap.get(term);
-
-                for(var postingEntry: termEntry.getValue().entrySet()) {
-                    int docId = postingEntry.getKey();
-                    Posting posting = postingEntry.getValue();
-
-                    ps.setInt(1, termId);
-                    ps.setInt(2, docId);
-                    ps.setInt(3, posting.getTermFrequency());
-                    ps.setArray(4,
-                        connection.createArrayOf("INTEGER", posting.getPositions().toArray())
-                    );
-                    ps.setArray(5,
-                        connection.createArrayOf("INTEGER", posting.getOffsets().toArray())
-                    );
-
-                    ps.addBatch();
-                }
-            }
-            ps.executeBatch();
+            ps.setInt(1, termId);
+            ps.setInt(2, docId);
+            ps.setInt(3, posting.getTermFrequency());
+            ps.setArray(4, connection.createArrayOf("INTEGER", posting.getPositions().toArray()));
+            ps.setArray(5, connection.createArrayOf("INTEGER", posting.getOffsets().toArray()));
+            ps.executeUpdate();
         }
-    }
-
-    private void rollbackTransaction() {
-        try {
-            connection.rollback();
-        } catch (SQLException ignored) { }
     }
 
     private void resetAutoCommit() {
@@ -173,4 +177,14 @@ public class IndexRepositoryImpl implements IndexRepository {
     
         return index;
     }
+
+    private static class TermLookup {
+        final int id;
+        final boolean isNew;
+        TermLookup(int id, boolean isNew) {
+            this.id = id;
+            this.isNew = isNew;
+        }
+    }
+
 }
