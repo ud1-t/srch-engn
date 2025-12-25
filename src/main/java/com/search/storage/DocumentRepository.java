@@ -6,6 +6,9 @@ import java.util.Map;
 import com.search.model.Document;
 
 public interface DocumentRepository {
-    Map<String, Integer> saveDocuments(List<Document> documents);
-    Map<Integer, Document> loadDocuments();
+    Map<String, Integer> saveCanonicalDocuments(List<Document> documents);
+    Map<Integer, Document> loadCanonicalDocuments();
+    Map<Integer, Integer> mapToSegment(int segmentId, List<Integer> canonicalDocIds);
+    Map<Integer, Integer> loadSegmentDocuments(int segmentId);
 }
+
