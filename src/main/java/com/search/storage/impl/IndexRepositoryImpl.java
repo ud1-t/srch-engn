@@ -107,25 +107,7 @@ public class IndexRepositoryImpl implements IndexRepository {
             throw new RuntimeException(e);
         }
     }
-
-    private boolean isNewCanonicalForTerm(int termId, int canonicalDocId) throws SQLException {
-        String sql = """
-            SELECT 1
-            FROM postings p
-            JOIN segment_documents sd
-            ON p.segment_id = sd.segment_id
-            AND p.doc_id = sd.doc_id
-            WHERE p.term_id = ?
-            AND sd.canonical_doc_id = ?
-        """;
-
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setInt(1, termId);
-            ps.setInt(2, canonicalDocId);
-            return !ps.executeQuery().next();
-        }
-    }
-
+    
     private int getOrCreateTerm(String term) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(SELECT_TERM_ID_SQL)) {
             ps.setString(1, term);
