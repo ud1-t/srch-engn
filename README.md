@@ -1,6 +1,6 @@
-# srch-engn (Segmented Inverted Index)
+# srch-engn (Segmented Inverted Index + AI)
 
-This repository contains a search engine built to understand how real-world search engines are designed beyond the basic “term → document list” idea.
+This repository contains a search engine built to understand how real-world search engines are designed beyond the basic "term → document list" idea. Extended with AI-powered hybrid search and RAG (Retrieval-Augmented Generation).
 
 ## What This Is
 
@@ -15,6 +15,9 @@ A single-node, multi-segment search engine that:
 - Supports:
     - boolean AND queries
     - TF-IDF ranking
+    - **hybrid search** (TF-IDF + semantic vector search with RRF fusion)
+    - **semantic search** (cosine similarity over Gemini embeddings)
+    - **RAG** (retrieval-augmented generation for natural language Q&A)
     - snippet generation
 
 - Persists data in PostgreSQL
@@ -97,6 +100,14 @@ This happens because:
 
 This is intentional and educational.
 
+### 6. Hybrid Search (TF-IDF + Semantic)
+
+Results from keyword search (TF-IDF) and semantic vector search (cosine similarity) are merged using Reciprocal Rank Fusion (RRF) with k=60. This demonstrates how modern search engines combine multiple ranking signals.
+
+### 7. RAG (Retrieval-Augmented Generation)
+
+Top-K documents from hybrid search are fed as context to an LLM (Gemini 2.5 Flash Lite) to generate direct, cited answers to natural language questions.
+
 #
 
 ### This project explicitly avoids orthogonal problems that would hide the core lessons.
@@ -120,30 +131,48 @@ This is intentional and educational.
           │       Segment (immutable)      │
           │               ~                │
           │   Documents + Inverted Index   │
-          └───────────────┬────────────────┘
-                          │
-               ┌──────────▼───────────┐
-               │ PostgreSQL Storage   │
-               │                      │
-               │ canonical_documents  │
-               │ segment_documents    │
-               │ postings             │
-               │ terms                │
-               │ segments             │
-               └──────────────────────┘
+          └───────────┬───────┬────────────┘
+                      │       │
+           ┌──────────▼──┐  ┌─▼──────────────┐
+           │  PostgreSQL │  │ Gemini Embedding│
+           │  Storage    │  │   (768-dim)     │
+           │             │  └────────┬────────┘
+           │ canonical   │           │
+           │ _documents  │◄──────────┘
+           │ (+ embedding│    stored as JSON
+           │  TEXT col)  │
+           │ segment_docs│
+           │ postings    │
+           │ terms       │
+           │ segments    │
+           └──────┬──────┘
+                  │
+       ┌──────────▼──────────┐
+       │     Query Time      │
+       │                     │
+       │  ┌───────┐ ┌──────┐ │
+       │  │TF-IDF │ │Cosine│ │
+       │  │Keyword│ │Simil.│ │
+       │  └───┬───┘ └──┬───┘ │
+       │      └────┬────┘     │
+       │      ┌────▼────┐     │
+       │      │  RRF    │     │
+       │      │ Fusion  │     │
+       │      └────┬────┘     │
+       │           │          │
+       │     ┌─────▼─────┐   │
+       │     │   RAG     │   │
+       │     │ (optional)│   │
+       │     │ Gemini LLM│   │
+       │     └───────────┘   │
+       └─────────────────────┘
 ```
-
-At query time:
-
-- Queries fan out across active segments
-- Each segment produces scores
-- Results are merged and ranked
 
 ## Repository Structure
 
 ```
 fetch/
-  WikipediaFetcher
+  WikipediaFetcher              Full article text via Wikipedia extract API
 
 processing/
   Tokenization
@@ -172,19 +201,34 @@ storage/
     - postings
     - segments
 
+embedding/                     ← NEW
+  EmbeddingService             Gemini embedding API client (768-dim)
+  EmbeddingStore               JSON text storage in PostgreSQL
+
 query/
   Boolean query execution
   Snippet generation using offsets
+  SemanticQueryEngine          ← NEW: cosine similarity search
+  HybridQueryEngine            ← NEW: RRF fusion of TF-IDF + semantic
 
 ranking/
   TF-IDF ranking implementation
+  CosineSimilarity             ← NEW: vector similarity
+
+rag/                           ← NEW
+  LlmClient                   Gemini 2.5 Flash Lite API client
+  ContextAssembler             Top-K doc context builder
+  RagPipeline                  Full RAG orchestration
 
 shell/
   Interactive CLI (SearchShell)
   Exposes:
     - seed
     - seed-file
-    - search
+    - search (hybrid)
+    - semantic-search
+    - ask (RAG)
+    - reindex-embeddings
     - merge
 ```
 
@@ -194,20 +238,37 @@ shell/
 
 - Java 17+
 - Docker + Docker Compose
+- Gemini API key (optional, for AI features)
 
-Start PostgreSQL
+### Environment Setup
+
+```bash
+# Set Gemini API key (required for semantic search, hybrid search, and RAG)
+export GEMINI_API_KEY=your_key_here
+```
+
+Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+Without the API key, the engine falls back to keyword-only TF-IDF search.
+
+### Start PostgreSQL
 
 ```
 docker-compose up -d
 ```
 
-Initialize Schema
+### Initialize Schema (if not using docker-compose init)
 
 ```
 psql -h localhost -U search -d search -f schema.sql
 ```
 
-Build & Run
+If adding AI features to an existing database, run:
+```sql
+ALTER TABLE canonical_documents ADD COLUMN IF NOT EXISTS embedding TEXT;
+```
+
+### Build & Run
 
 ```
 mvn clean package
@@ -216,12 +277,15 @@ java -jar target/search-engine.jar
 
 ## Supported Commands
 
-- `seed <page-key>`
-- `seed-file <path>`
-- `search <query>`
-- `merge <segA> <segB>`
-- `load`
-- `exit`
+- `seed <page-key>` — Fetch and index a Wikipedia page (also generates embedding if AI enabled)
+- `seed-file <path>` — Seed multiple pages from a file
+- `search <query>` — Hybrid search (TF-IDF + semantic) or keyword-only if AI disabled
+- `semantic-search <query>` — Pure semantic vector search (requires GEMINI_API_KEY)
+- `ask <question>` — RAG: retrieves docs, generates AI answer with citations (requires GEMINI_API_KEY)
+- `reindex-embeddings` — Generate embeddings for all documents missing them (requires GEMINI_API_KEY)
+- `merge <segA> <segB>` — Merge two segments
+- `load` — Reload from database
+- `exit` — Exit
 
 ## Why This Exists
 
@@ -231,5 +295,7 @@ This project exists to answer questions like:
 - Why does scoring change after merges?
 - Why is deletion expensive?
 - Why do real systems tolerate approximation?
+- How do hybrid search systems combine keyword and semantic signals?
+- How does RAG ground LLM answers in retrieved evidence?
 
 The answers emerge naturally once you try to build one.

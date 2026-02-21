@@ -12,6 +12,8 @@ import java.util.Scanner;
 import java.util.Set;
 
 import com.search.console.ConsoleUI;
+import com.search.embedding.EmbeddingService;
+import com.search.embedding.EmbeddingStore;
 import com.search.fetch.DocumentFetcher;
 import com.search.fetch.impl.WikipediaFetcher;
 import com.search.index.InvertedIndex;
@@ -19,9 +21,12 @@ import com.search.index.Posting;
 import com.search.model.Document;
 import com.search.model.Token;
 import com.search.processing.TextProcessor;
+import com.search.query.HybridQueryEngine;
 import com.search.query.QueryExecutor;
 import com.search.query.QueryParser;
+import com.search.query.SemanticQueryEngine;
 import com.search.query.SnippetGenerator;
+import com.search.rag.RagPipeline;
 import com.search.ranking.Ranker;
 import com.search.ranking.TfIdfRanker;
 import com.search.segment.Segment;
@@ -47,6 +52,14 @@ public class SearchShell {
     private final Ranker ranker = new TfIdfRanker();
     private final SnippetGenerator snippetGenerator = new SnippetGenerator();
 
+    // AI components — initialized if GEMINI_API_KEY is available
+    private EmbeddingService embeddingService;
+    private EmbeddingStore embeddingStore;
+    private SemanticQueryEngine semanticQueryEngine;
+    private HybridQueryEngine hybridQueryEngine;
+    private RagPipeline ragPipeline;
+    private boolean aiEnabled = false;
+
     public void run() {
         initializeFromRepo();
         repl();
@@ -63,6 +76,9 @@ public class SearchShell {
             segmentRepository = new SegmentRepositoryImpl(connection);
             documentRepository = new DocumentRepositoryImpl(connection);
             indexRepository = new IndexRepositoryImpl(connection);
+
+            // Initialize AI components
+            initializeAI(connection);
 
             segmentManager.clear();
 
@@ -89,6 +105,25 @@ public class SearchShell {
         } catch (Exception e) {
             throw new RuntimeException("Failed to initialize", e);
         }
+    }
+
+    private void initializeAI(Connection connection) {
+        String apiKey = System.getenv("GEMINI_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            System.out.println("Warning: GEMINI_API_KEY not set. AI features (semantic search, ask) disabled.");
+            aiEnabled = false;
+            return;
+        }
+
+        embeddingService = new EmbeddingService(apiKey);
+        embeddingStore = new EmbeddingStore(connection);
+        semanticQueryEngine = new SemanticQueryEngine(embeddingService, embeddingStore);
+        hybridQueryEngine = new HybridQueryEngine(
+            segmentManager, queryParser, ranker, semanticQueryEngine, documentRepository
+        );
+        ragPipeline = new RagPipeline(hybridQueryEngine, documentRepository, apiKey);
+        aiEnabled = true;
+        System.out.println("AI features enabled (semantic search, RAG).");
     }
 
     private void repl() {
@@ -121,8 +156,14 @@ public class SearchShell {
                 seedFile(input.substring(10).trim());
             else if (input.startsWith("seed "))
                 seed(input.substring(5).trim());
+            else if (input.startsWith("semantic-search "))
+                semanticSearch(input.substring(16).trim());
             else if (input.startsWith("search "))
                 search(input.substring(7).trim());
+            else if (input.startsWith("ask "))
+                ask(input.substring(4).trim());
+            else if (input.equals("reindex-embeddings"))
+                reindexEmbeddings();
             else if (input.startsWith("merge ")) {
                 String[] parts = input.split("\\s+");
                 if(parts.length != 3) {
@@ -161,6 +202,9 @@ public class SearchShell {
         segment.addDocument(docId, doc, tokens);
         segmentManager.addSegment(segment);
 
+        // Generate and store embedding
+        embedDocument(canonicalId, doc);
+
         System.out.println("Created segment " + segmentId + " | docId=" + docId + " | " + doc.getTitle());
     }
 
@@ -186,16 +230,19 @@ public class SearchShell {
             int segmentId = segmentRepository.createSegment();
             Segment segment = new Segment(segmentId);
 
-            Map<Integer, Integer> mapping = documentRepository.mapToSegment(segmentId, newCanonicalIds);
+            Map<Integer, Integer> mappingResult = documentRepository.mapToSegment(segmentId, newCanonicalIds);
 
             for(Document doc : docs) {
                 int canonicalId = canonicalIds.get(doc.getUrl());
-                Integer docId = mapping.get(canonicalId);
+                Integer docId = mappingResult.get(canonicalId);
                 if(docId == null) continue;
 
                 List<Token> tokens = processor.process(doc.getContent());
                 indexRepository.appendDocument(segmentId, docId, canonicalId, tokens);
                 segment.addDocument(docId, doc, tokens);
+
+                // Generate and store embedding
+                embedDocument(canonicalId, doc);
             }
 
             segmentManager.addSegment(segment);
@@ -205,7 +252,101 @@ public class SearchShell {
         }
     }
 
+    private void embedDocument(int canonicalId, Document doc) {
+        if (!aiEnabled) return;
+        try {
+            float[] embedding = embeddingService.embed(doc.getTitle() + ". " + doc.getContent());
+            embeddingStore.storeEmbedding(canonicalId, embedding);
+        } catch (Exception e) {
+            System.err.println("Warning: Failed to generate embedding for '" + doc.getTitle() + "': " + e.getMessage());
+        }
+    }
+
+    private void reindexEmbeddings() {
+        if (!aiEnabled) {
+            System.out.println("Requires GEMINI_API_KEY to be set.");
+            return;
+        }
+
+        Map<Integer, Document> canonicalDocs = documentRepository.loadCanonicalDocuments();
+        int success = 0;
+        int failed = 0;
+
+        for (var entry : canonicalDocs.entrySet()) {
+            int id = entry.getKey();
+            Document doc = entry.getValue();
+
+            // Check if already has embedding
+            float[] existing = embeddingStore.getEmbedding(id);
+            if (existing != null) {
+                System.out.println("  Skipping (already has embedding): " + doc.getTitle());
+                continue;
+            }
+
+            try {
+                float[] embedding = embeddingService.embed(doc.getTitle() + ". " + doc.getContent());
+                embeddingStore.storeEmbedding(id, embedding);
+                success++;
+                System.out.println("  Embedded: " + doc.getTitle());
+            } catch (Exception e) {
+                failed++;
+                System.err.println("  Failed: " + doc.getTitle() + " — " + e.getMessage());
+            }
+        }
+
+        System.out.println("Reindex complete. Success: " + success + ", Failed: " + failed);
+    }
+
     private void search(String query) {
+        if (aiEnabled) {
+            hybridSearch(query);
+        } else {
+            keywordSearch(query);
+        }
+    }
+
+    private void hybridSearch(String query) {
+        List<HybridQueryEngine.HybridResult> results = hybridQueryEngine.search(query);
+        List<String> terms = queryParser.parse(query);
+
+        ConsoleUI.header("HYBRID SEARCH RESULTS");
+
+        if (results.isEmpty()) {
+            System.out.println("No results found.");
+            return;
+        }
+
+        for (HybridQueryEngine.HybridResult r : results) {
+            ConsoleUI.kv("Title", r.title());
+            ConsoleUI.kv("URL", r.url());
+            ConsoleUI.kv("Score", String.format("%.6f (RRF)", r.score()));
+
+            if (r.segment() != null && r.docId() >= 0) {
+                ConsoleUI.kv("Segment", String.valueOf(r.segment().getSegmentId()));
+                Document doc = r.segment().getDocuments().get(r.docId());
+                if (doc != null) {
+                    for (String term : terms) {
+                        var postings = r.segment().getIndex().getPostings(term);
+                        Posting posting = postings.get(r.docId());
+                        if (posting == null) continue;
+
+                        for (int i = 0; i < posting.getOffsets().size(); i++) {
+                            String snippet = snippetGenerator.generate(
+                                doc.getContent(),
+                                posting.getOffsets().get(i),
+                                term
+                            );
+                            System.out.println("SNIPPET [" + term + " #" + (i + 1) + "]: " + snippet);
+                        }
+                    }
+                }
+            }
+
+            ConsoleUI.line();
+        }
+    }
+
+    private void keywordSearch(String query) {
         List<String> terms = queryParser.parse(query);
         List<SearchResult> results = new ArrayList<>();
 
@@ -224,13 +365,59 @@ public class SearchShell {
             }
         }
 
-        // results.sort(Comparator.comparingDouble((SearchResult r) -> r.score).reversed());
         results.sort(Comparator.comparingDouble(r -> -r.score));
 
         ConsoleUI.header("SEARCH RESULTS");
 
         for(SearchResult r : results) {
             printResult(r.segment, r.docId, r.score, terms);
+        }
+    }
+
+    private void semanticSearch(String query) {
+        if (!aiEnabled) {
+            System.out.println("Semantic search requires GEMINI_API_KEY to be set.");
+            return;
+        }
+
+        try {
+            List<SemanticQueryEngine.ScoredDocument> results = semanticQueryEngine.search(query);
+            Map<Integer, Document> canonicalDocs = documentRepository.loadCanonicalDocuments();
+
+            ConsoleUI.header("SEMANTIC SEARCH RESULTS");
+
+            if (results.isEmpty()) {
+                System.out.println("No results found.");
+                return;
+            }
+
+            int shown = 0;
+            for (SemanticQueryEngine.ScoredDocument r : results) {
+                if (shown >= 10) break;
+                Document doc = canonicalDocs.get((int) r.canonicalDocId());
+                if (doc == null) continue;
+
+                ConsoleUI.kv("Title", doc.getTitle());
+                ConsoleUI.kv("URL", doc.getUrl());
+                ConsoleUI.kv("Score", String.format("%.6f (cosine)", r.score()));
+                ConsoleUI.line();
+                shown++;
+            }
+        } catch (Exception e) {
+            System.err.println("Semantic search failed: " + e.getMessage());
+        }
+    }
+
+    private void ask(String question) {
+        if (!aiEnabled) {
+            System.out.println("RAG requires GEMINI_API_KEY to be set.");
+            return;
+        }
+
+        try {
+            ragPipeline.ask(question);
+        } catch (Exception e) {
+            System.err.println("RAG failed: " + e.getMessage());
         }
     }
 
@@ -305,7 +492,16 @@ public class SearchShell {
         System.out.println("      Seed multiple Wikipedia pages from a file (one key per line)");
         System.out.println();
         System.out.println("  search <query>");
-        System.out.println("      Search indexed documents");
+        System.out.println("      Search indexed documents (hybrid: TF-IDF + semantic if AI enabled)");
+        System.out.println();
+        System.out.println("  semantic-search <query>");
+        System.out.println("      Pure semantic vector search (requires GEMINI_API_KEY)");
+        System.out.println();
+        System.out.println("  ask <question>");
+        System.out.println("      Ask a question — retrieves docs and generates AI answer (requires GEMINI_API_KEY)");
+        System.out.println();
+        System.out.println("  reindex-embeddings");
+        System.out.println("      Generate embeddings for all documents missing them (requires GEMINI_API_KEY)");
         System.out.println();
         System.out.println("  merge <segA> <segB>");
         System.out.println("      Merge two segments");
