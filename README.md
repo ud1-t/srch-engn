@@ -133,7 +133,7 @@ Top-K documents from hybrid search are fed as context to an LLM (Gemini 2.5 Flas
           │   Documents + Inverted Index   │
           └───────────┬───────┬────────────┘
                       │       │
-           ┌──────────▼──┐  ┌─▼──────────────┐
+           ┌──────────▼──┐  ┌─▼───────────────┐
            │  PostgreSQL │  │ Gemini Embedding│
            │  Storage    │  │   (768-dim)     │
            │             │  └────────┬────────┘
@@ -147,25 +147,25 @@ Top-K documents from hybrid search are fed as context to an LLM (Gemini 2.5 Flas
            │ segments    │
            └──────┬──────┘
                   │
-       ┌──────────▼──────────┐
-       │     Query Time      │
-       │                     │
-       │  ┌───────┐ ┌──────┐ │
-       │  │TF-IDF │ │Cosine│ │
-       │  │Keyword│ │Simil.│ │
-       │  └───┬───┘ └──┬───┘ │
+       ┌──────────▼───────────┐
+       │     Query Time       │
+       │                      │
+       │  ┌───────┐ ┌──────┐  │
+       │  │TF-IDF │ │Cosine│  │
+       │  │Keyword│ │Simil.│  │
+       │  └───┬───┘ └──┬───┘  │
        │      └────┬────┘     │
        │      ┌────▼────┐     │
        │      │  RRF    │     │
        │      │ Fusion  │     │
        │      └────┬────┘     │
        │           │          │
-       │     ┌─────▼─────┐   │
-       │     │   RAG     │   │
-       │     │ (optional)│   │
-       │     │ Gemini LLM│   │
-       │     └───────────┘   │
-       └─────────────────────┘
+       │     ┌─────▼─────┐    │
+       │     │   RAG     │    │
+       │     │ (optional)│    │
+       │     │ Gemini LLM│    │
+       │     └───────────┘    │
+       └──────────────────────┘
 ```
 
 ## Repository Structure
